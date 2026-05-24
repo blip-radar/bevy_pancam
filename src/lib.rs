@@ -5,8 +5,11 @@
 mod egui_support;
 mod normalized_zoom_inputs;
 use bevy::{
-    camera::CameraProjection,
-    input::{gestures::PinchGesture, mouse::MouseWheel},
+    camera::{CameraProjection, RenderTarget},
+    input::{
+        gestures::PinchGesture,
+        mouse::{MouseScrollUnit, MouseWheel},
+    },
     math::{
         Rect,
         bounding::{Aabb2d, BoundingVolume},
@@ -16,6 +19,7 @@ use bevy::{
     window::PrimaryWindow,
 };
 use normalized_zoom_inputs::NormalizedZoomInputs;
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 /// Plugin that adds the necessary systems for `PanCam` components to work
@@ -124,22 +128,62 @@ impl Plugin for PanCamPlugin {
 }
 
 fn do_camera_zoom(
-    mut query: Query<(&PanCam, &Camera, &mut Projection, &mut Transform)>,
-    pinch_events: MessageReader<PinchGesture>,
-    scroll_events: MessageReader<MouseWheel>,
-    primary_window: Query<&Window, With<PrimaryWindow>>,
+    mut query: Query<(
+        &PanCam,
+        &Camera,
+        &RenderTarget,
+        &mut Projection,
+        &mut Transform,
+    )>,
+    mut pinch_events: MessageReader<PinchGesture>,
+    mut scroll_events: MessageReader<MouseWheel>,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
+    windows: Query<&Window>,
+    #[cfg(feature = "internal_bevy_egui")] egui_wants_focus: Res<
+        egui_support::EguiWantsFocus,
+    >,
 ) {
-    let zoom_inputs = NormalizedZoomInputs::from_events(scroll_events, pinch_events);
-    if zoom_inputs.is_empty() {
+    // Accumulate wheel delta per window entity.
+    const NORMALIZE: f32 = 0.001;
+    const PIXELS_PER_LINE: f32 = 100.;
+    let mut wheel_by_window: HashMap<Entity, f32> = HashMap::new();
+    for ev in scroll_events.read() {
+        let delta = match ev.unit {
+            MouseScrollUnit::Pixel => ev.y,
+            MouseScrollUnit::Line => ev.y * PIXELS_PER_LINE,
+        } * NORMALIZE;
+        *wheel_by_window.entry(ev.window).or_default() += delta;
+    }
+
+    let pinch_total: f32 = pinch_events.read().map(|e| e.0).sum();
+
+    if wheel_by_window.is_empty() && pinch_total == 0. {
         return;
     }
 
-    let Ok(window) = primary_window.single() else {
-        return;
-    };
-
-    for (pan_cam, camera, mut proj, mut transform) in &mut query {
+    for (pan_cam, camera, render_target, mut proj, mut transform) in &mut query {
         if !pan_cam.enabled {
+            continue;
+        }
+
+        let Some(window_entity) =
+            window_for_render_target(render_target, primary_window.single().ok())
+        else {
+            continue;
+        };
+        #[cfg(feature = "internal_bevy_egui")]
+        if egui_wants_focus.0.contains(&window_entity) {
+            continue;
+        }
+        let Ok(window) = windows.get(window_entity) else {
+            continue;
+        };
+
+        let wheel = wheel_by_window.get(&window_entity).copied().unwrap_or(0.);
+        // PinchGesture has no window field — scope it to the focused window.
+        let pinch = if window.focused { pinch_total } else { 0. };
+        let zoom_inputs = NormalizedZoomInputs { wheel, pinch };
+        if zoom_inputs.is_empty() {
             continue;
         }
 
@@ -244,31 +288,64 @@ fn clamp_to_safe_zone(pos: Vec2, aabb: Aabb2d, bounded_area_size: Vec2) -> Vec2 
     pos.clamp(aabb.min, aabb.max)
 }
 
+/// Returns the `Window` `Entity` from the `RenderTarget`
+fn window_for_render_target(
+    render_target: &RenderTarget,
+    primary_window: Option<Entity>,
+) -> Option<Entity> {
+    let RenderTarget::Window(window_ref) = render_target else {
+        return None;
+    };
+    window_ref
+        .normalize(primary_window)
+        .map(|normalized_window_ref| normalized_window_ref.entity())
+}
+
 fn do_camera_movement(
-    primary_window: Query<&Window, With<PrimaryWindow>>,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
+    windows: Query<&Window>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     keyboard_buttons: Res<ButtonInput<KeyCode>>,
-    mut query: Query<(&PanCam, &Camera, &mut Transform, &Projection)>,
-    mut last_pos: Local<Option<Vec2>>,
+    mut query: Query<(&PanCam, &Camera, &RenderTarget, &mut Transform, &Projection)>,
+    // Use position instead of MouseMotion, otherwise we don't get acceleration movement.
+    mut last_pos: Local<HashMap<Entity, Vec2>>,
     time: Res<Time<Real>>,
+    #[cfg(feature = "internal_bevy_egui")] egui_wants_focus: Res<
+        egui_support::EguiWantsFocus,
+    >,
 ) {
-    let Ok(window) = primary_window.single() else {
-        return;
-    };
-    let window_size = window.size();
+    // Collect last_pos updates after the loop to avoid polluting reads when multiple
+    // cameras share the same window.
+    let mut pos_updates: Vec<(Entity, Vec2)> = Vec::new();
 
-    // Use position instead of MouseMotion, otherwise we don't get acceleration
-    // movement
-    let current_pos = match window.cursor_position() {
-        Some(c) => vec2(c.x, -c.y),
-        None => return,
-    };
-    let delta_device_pixels = current_pos - last_pos.unwrap_or(current_pos);
-
-    for (pan_cam, camera, mut transform, projection) in &mut query {
+    for (pan_cam, camera, render_target, mut transform, projection) in &mut query {
         if !pan_cam.enabled {
             continue;
         }
+
+        let Some(window_entity) =
+            window_for_render_target(render_target, primary_window.single().ok())
+        else {
+            continue;
+        };
+        #[cfg(feature = "internal_bevy_egui")]
+        if egui_wants_focus.0.contains(&window_entity) {
+            continue;
+        }
+        let Ok(window) = windows.get(window_entity) else {
+            continue;
+        };
+
+        let current_pos = match window.cursor_position() {
+            Some(c) => vec2(c.x, -c.y),
+            None => {
+                last_pos.remove(&window_entity);
+                continue;
+            }
+        };
+
+        let last = last_pos.get(&window_entity).copied();
+        let delta_device_pixels = current_pos - last.unwrap_or(current_pos);
 
         let projection = match projection {
             Projection::Orthographic(proj) => proj,
@@ -276,8 +353,7 @@ fn do_camera_movement(
         };
 
         let proj_area_size = projection.area.size();
-
-        let viewport_size = camera.logical_viewport_size().unwrap_or(window_size);
+        let viewport_size = camera.logical_viewport_size().unwrap_or(window.size());
         let world_units_per_pixel = proj_area_size / viewport_size;
 
         let mouse_delta = if !pan_cam
@@ -290,7 +366,13 @@ fn do_camera_movement(
             delta_device_pixels * world_units_per_pixel
         };
 
-        let direction = pan_cam.move_keys.direction(&keyboard_buttons);
+        // Keyboard movement is scoped to the focused window to avoid moving cameras
+        // in all windows simultaneously.
+        let direction = if window.focused {
+            pan_cam.move_keys.direction(&keyboard_buttons)
+        } else {
+            Vec2::ZERO
+        };
 
         let keyboard_delta = time.delta_secs()
             * direction.normalize_or_zero()
@@ -298,18 +380,19 @@ fn do_camera_movement(
             * world_units_per_pixel;
         let delta = mouse_delta - keyboard_delta;
 
-        if delta == Vec2::ZERO {
-            continue;
+        if delta != Vec2::ZERO {
+            let proposed_cam_pos = transform.translation.truncate() - delta;
+            transform.translation =
+                clamp_to_safe_zone(proposed_cam_pos, pan_cam.aabb(), proj_area_size)
+                    .extend(transform.translation.z);
         }
 
-        // The proposed new camera position
-        let proposed_cam_pos = transform.translation.truncate() - delta;
-
-        transform.translation =
-            clamp_to_safe_zone(proposed_cam_pos, pan_cam.aabb(), proj_area_size)
-                .extend(transform.translation.z);
+        pos_updates.push((window_entity, current_pos));
     }
-    *last_pos = Some(current_pos);
+
+    for (entity, pos) in pos_updates {
+        last_pos.insert(entity, pos);
+    }
 }
 
 fn on_clamp_bounds(
